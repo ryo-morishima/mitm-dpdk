@@ -38,6 +38,16 @@
 #include <rte_ethdev.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
+#include <rte_ip.h>
+#include <rte_tcp.h>
+#include <rte_udp.h>
+
+#define uint32_t_to_char(ip, a, b, c, d) do {\
+    *a = (unsigned char)(ip >> 24 & 0xff);\
+    *b = (unsigned char)(ip >> 16 & 0xff);\
+    *c = (unsigned char)(ip >> 8 & 0xff);\
+    *d = (unsigned char)(ip & 0xff);\
+} while (0)
 
 static volatile bool force_quit;
 
@@ -101,7 +111,7 @@ struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 /* A tsc-based timer responsible for triggering statistics printout */
-static uint64_t timer_period = 10; /* default period is 10 seconds */
+static uint64_t timer_period = 0; /* default period is 10 seconds */
 
 /* Print out statistics on packets dropped */
 static void
@@ -276,6 +286,76 @@ l2fwd_main_loop(void)
 
             for (j = 0; j < nb_rx; j++) {
                 m = pkts_burst[j];
+
+                struct rte_ether_hdr *eth_hdr;
+                struct rte_ipv4_hdr *ipv4_hdr;
+                struct rte_ipv6_hdr *ipv6_hdr;
+                struct rte_tcp_hdr *tcp_hdr;
+                struct rte_udp_hdr *udp_hdr;
+                uint64_t l2_len;
+                uint64_t l3_len;
+                uint64_t l4_len;
+                uint64_t packet_len;
+                uint64_t content_len;
+                uint8_t *content;
+
+                eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+                l2_len = sizeof(struct rte_ether_hdr);
+
+                //print mac address
+                printf("srcMAC:  %02X:%02X:%02X:%02X:%02X:%02X,  dstMAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    eth_hdr->s_addr.addr_bytes[0],
+                    eth_hdr->s_addr.addr_bytes[1],
+                    eth_hdr->s_addr.addr_bytes[2],
+                    eth_hdr->s_addr.addr_bytes[3],
+                    eth_hdr->s_addr.addr_bytes[4],
+                    eth_hdr->s_addr.addr_bytes[5],
+                    eth_hdr->d_addr.addr_bytes[0],
+                    eth_hdr->d_addr.addr_bytes[1],
+                    eth_hdr->d_addr.addr_bytes[2],
+                    eth_hdr->d_addr.addr_bytes[3],
+                    eth_hdr->d_addr.addr_bytes[4],
+                    eth_hdr->d_addr.addr_bytes[5]);
+
+                if (RTE_ETH_IS_IPV4_HDR(m->packet_type)) {
+                    ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+                    l3_len = sizeof(struct rte_ipv4_hdr);
+                    packet_len = rte_be_to_cpu_16(ipv4_hdr->total_length) + l2_len;
+
+                    // print ip address and port
+                    unsigned char a, b, c, d;
+                    uint32_t_to_char(rte_bswap32(ipv4_hdr->src_addr), &a, &b, &c, &d);
+                    printf("srcIP:   %hhu.%hhu.%hhu.%hhu,  ", a, b, c, d);
+                    uint32_t_to_char(rte_bswap32(ipv4_hdr->dst_addr), &a, &b, &c, &d);
+                    printf("dstIP: %hhu.%hhu.%hhu.%hhu\n", a, b, c, d);
+                    printf("srcPORT: %hu,  dstPORT: %hu\n",
+                        rte_bswap16(*(uint16_t *)(ipv4_hdr + 1)),
+                        rte_bswap16(*((uint16_t *)(ipv4_hdr + 1) + 1)));
+
+                    switch (ipv4_hdr->next_proto_id) {
+                    case IPPROTO_TCP:
+                        tcp_hdr = (struct rte_tcp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
+                        l4_len = (tcp_hdr->data_off & 0xf0) >> 2;
+                        content = (uint8_t *)((char *)tcp_hdr + l4_len);
+                        content_len = packet_len - l2_len - l3_len - l4_len;
+                        if (content_len >0) {
+                            char *c = (char *)rte_calloc(0, content_len+1, sizeof(char), 0);
+                            rte_memcpy(c, (void *)content, content_len);
+                            c[content_len] = '\0';
+                            printf("content: %s", c);
+                        }
+                        printf("\n");
+                        break;
+                    case IPPROTO_UDP:
+                        udp_hdr = (struct rte_udp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
+                        break;
+                    default:
+                        break;
+                    }
+                } else if (RTE_ETH_IS_IPV6_HDR(m->packet_type)) {
+                    ipv6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
+                }
+
                 rte_prefetch0(rte_pktmbuf_mtod(m, void *));
                 l2fwd_simple_forward(m, portid);
             }
