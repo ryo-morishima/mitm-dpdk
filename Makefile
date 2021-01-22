@@ -5,7 +5,7 @@
 APP = l2fwd
 
 # all source are stored in SRCS-y
-SRCS-y := main.c
+SRCS-y := $(SRCDIR)/main.cpp $(SRCDIR)/stream.cpp
 
 ## Build using pkg-config variables if possible
 #ifeq ($(shell pkg-config --exists libdpdk && echo 0),0)

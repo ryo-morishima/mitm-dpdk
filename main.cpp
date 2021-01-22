@@ -42,6 +42,15 @@
 #include <rte_tcp.h>
 #include <rte_udp.h>
 
+#include <iostream>
+#include <string>
+#include <regex>
+#include <unordered_map>
+#include "stream.hpp"
+using namespace std;
+
+unordered_map<string, class Stream*> umap;
+
 #define uint32_t_to_char(ip, a, b, c, d) do {\
     *a = (unsigned char)(ip >> 24 & 0xff);\
     *b = (unsigned char)(ip >> 16 & 0xff);\
@@ -298,12 +307,18 @@ l2fwd_main_loop(void)
                 uint64_t packet_len;
                 uint64_t content_len;
                 uint8_t *content;
+                uint16_t src_port;
+                uint16_t dst_port;
+                char str[64] = {};
+                char hash_value[64] = {};
+                int diff = 0;
+                Stream *stream;
 
                 eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
                 l2_len = sizeof(struct rte_ether_hdr);
 
                 //print mac address
-                printf("srcMAC:  %02X:%02X:%02X:%02X:%02X:%02X,  dstMAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                printf("%02X:%02X:%02X:%02X:%02X:%02X ==> %02X:%02X:%02X:%02X:%02X:%02X\n",
                     eth_hdr->s_addr.addr_bytes[0],
                     eth_hdr->s_addr.addr_bytes[1],
                     eth_hdr->s_addr.addr_bytes[2],
@@ -325,36 +340,101 @@ l2fwd_main_loop(void)
                     // print ip address and port
                     unsigned char a, b, c, d;
                     uint32_t_to_char(rte_bswap32(ipv4_hdr->src_addr), &a, &b, &c, &d);
-                    printf("srcIP:   %hhu.%hhu.%hhu.%hhu,  ", a, b, c, d);
+                    printf("%hhu.%hhu.%hhu.%hhu ==> ", a, b, c, d);
                     uint32_t_to_char(rte_bswap32(ipv4_hdr->dst_addr), &a, &b, &c, &d);
-                    printf("dstIP: %hhu.%hhu.%hhu.%hhu\n", a, b, c, d);
-                    printf("srcPORT: %hu,  dstPORT: %hu\n",
+                    printf("%hhu.%hhu.%hhu.%hhu\n", a, b, c, d);
+                    printf("Port: %hu ==> %hu\n",
                         rte_bswap16(*(uint16_t *)(ipv4_hdr + 1)),
                         rte_bswap16(*((uint16_t *)(ipv4_hdr + 1) + 1)));
 
-                    switch (ipv4_hdr->next_proto_id) {
-                    case IPPROTO_TCP:
+                    if (ipv4_hdr->next_proto_id == IPPROTO_TCP) {
                         tcp_hdr = (struct rte_tcp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
                         l4_len = (tcp_hdr->data_off & 0xf0) >> 2;
                         content = (uint8_t *)((char *)tcp_hdr + l4_len);
                         content_len = packet_len - l2_len - l3_len - l4_len;
-                        if (content_len >0) {
+                        src_port = rte_be_to_cpu_16(tcp_hdr->src_port);
+                        dst_port = rte_be_to_cpu_16(tcp_hdr->dst_port);
+                        if (src_port > dst_port) { // C2S connection
+                          sprintf(str, "%" PRIu32, ipv4_hdr->src_addr);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu32, ipv4_hdr->dst_addr);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu16, src_port);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu16, dst_port);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu8, ipv4_hdr->next_proto_id);
+                          strcat(hash_value, str);
+                        } else { // S2C connection
+                          sprintf(str, "%" PRIu32, ipv4_hdr->dst_addr);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu32, ipv4_hdr->src_addr);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu16, dst_port);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu16, src_port);
+                          strcat(hash_value, str);
+                          sprintf(str, "%" PRIu8, ipv4_hdr->next_proto_id);
+                          strcat(hash_value, str);
+                        }
+                        printf("hash: %s\n", hash_value);
+                        auto itr = umap.find(string(hash_value));
+                        if( itr != umap.end() ) { // stream is in umap
+                            cout << "stream exists" << endl;
+                            stream = itr->second;
+                        } else { // new stream
+                            cout << "new stream" << endl;
+                            stream = new Stream();
+                            umap[string(hash_value)] = stream;
+                        }
+
+                        // Modify the packet content
+                        if (content_len > 0 && stream) {
                             char *c = (char *)rte_calloc(0, content_len+1, sizeof(char), 0);
                             rte_memcpy(c, (void *)content, content_len);
                             c[content_len] = '\0';
-                            printf("content: %s", c);
+                            //printf("content: %s", c);
+
+                            string exp = R"(H\S*)";
+                            regex reg(exp);
+                            string replace = "Hey";
+                            
+                            string before = string(c);
+                            string after = regex_replace(before, reg, replace);
+                            cout << "before:'" << before << "'" << endl;
+                            cout << "after :'" << after << "'" << endl;
+                            diff = after.length() - before.length();
+                            cout << "diff: " << diff << endl;
+
+                            if (diff != 0) {
+                                // modify
+                            } else {
+                                cout << "No match" << endl;
+                            }
                         }
-                        printf("\n");
-                        break;
-                    case IPPROTO_UDP:
+
+                        // Recalculate SEQ and ACK
+
+                        // Update modified bytes
+                        if (src_port > dst_port) { // C2S connection
+                            stream->C2S_modified_bytes += diff;
+                            cout << "diff so far: " << stream->C2S_modified_bytes << endl;
+                        } else { // S2C connection
+                            stream->S2C_modified_bytes += diff;
+                            cout << "diff so far: " << stream->S2C_modified_bytes << endl;
+                        }
+
+                    } else if (ipv4_hdr->next_proto_id == IPPROTO_UDP) { 
                         udp_hdr = (struct rte_udp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
-                        break;
-                    default:
-                        break;
+                    } else {
+                        printf("Not TCP or UDP\n");
                     }
+
                 } else if (RTE_ETH_IS_IPV6_HDR(m->packet_type)) {
                     ipv6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
+                    printf("IPv6 Not implemented\n");
                 }
+                printf("\n");
 
                 rte_prefetch0(rte_pktmbuf_mtod(m, void *));
                 l2fwd_simple_forward(m, portid);
@@ -603,6 +683,19 @@ signal_handler(int signum)
 int
 main(int argc, char **argv)
 {
+    //test
+    //struct stream stm = {
+    //    .C2S_modified_bytes = 100
+    //    .S2C_modified_bytes = 200
+    //};
+    //struct stream stm;
+    //stm.C2S_modified_bytes = 100;
+    //stm.S2C_modified_bytes = 200;
+    //char key[] = "12345";
+    //add_stream(key, stm);
+    //struct stream val = get_stream(key);
+    //printf("c2s: %d    s2c: %d", val.C2S_modified_bytes, val.S2C_modified_bytes);
+    //test
     struct lcore_queue_conf *qconf;
     int ret;
     uint16_t nb_ports;
