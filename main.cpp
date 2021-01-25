@@ -309,9 +309,12 @@ l2fwd_main_loop(void)
                 uint8_t *content;
                 uint16_t src_port;
                 uint16_t dst_port;
+                uint32_t seq;
+                uint32_t ack;
                 char str[64] = {};
                 char hash_value[64] = {};
                 int diff = 0;
+                bool recalc_checksum = false;
                 Stream *stream;
 
                 eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
@@ -332,7 +335,7 @@ l2fwd_main_loop(void)
                     eth_hdr->d_addr.addr_bytes[4],
                     eth_hdr->d_addr.addr_bytes[5]);
 
-                if (RTE_ETH_IS_IPV4_HDR(m->packet_type)) {
+                if (RTE_ETH_IS_IPV4_HDR(m->packet_type)) { // IPv4
                     ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
                     l3_len = sizeof(struct rte_ipv4_hdr);
                     packet_len = rte_be_to_cpu_16(ipv4_hdr->total_length) + l2_len;
@@ -354,6 +357,9 @@ l2fwd_main_loop(void)
                         content_len = packet_len - l2_len - l3_len - l4_len;
                         src_port = rte_be_to_cpu_16(tcp_hdr->src_port);
                         dst_port = rte_be_to_cpu_16(tcp_hdr->dst_port);
+                        seq = rte_be_to_cpu_32(tcp_hdr->sent_seq);
+                        ack= rte_be_to_cpu_32(tcp_hdr->recv_ack);
+
                         if (src_port > dst_port) { // C2S connection
                           sprintf(str, "%" PRIu32, ipv4_hdr->src_addr);
                           strcat(hash_value, str);
@@ -395,9 +401,9 @@ l2fwd_main_loop(void)
                             c[content_len] = '\0';
                             //printf("content: %s", c);
 
-                            string exp = R"(H\S*)";
+                            string exp = R"(h\S*)";
                             regex reg(exp);
-                            string replace = "Hey";
+                            string replace = "hahahahaha";
                             
                             string before = string(c);
                             string after = regex_replace(before, reg, replace);
@@ -406,22 +412,64 @@ l2fwd_main_loop(void)
                             diff = after.length() - before.length();
                             cout << "diff: " << diff << endl;
 
-                            if (diff != 0) {
-                                // modify
+                            if (diff > 0) { // expand the packet payload
+                                if (rte_pktmbuf_append(m, (uint16_t)(diff))) {
+                                    // overwrite the payload
+                                    rte_memcpy(content, &after[0], after.length());
+
+                                    // recalculate ipv4 total length
+                                    ipv4_hdr->total_length = (uint16_t)rte_cpu_to_be_16(rte_pktmbuf_pkt_len(m) - sizeof(struct rte_ether_hdr));
+                                } else {
+                                    cout << "No tailroom space" << endl;
+                                }
+                            } else if (diff < 0) { // shrink the packet payload
+
                             } else {
                                 cout << "No match" << endl;
                             }
                         }
 
-                        // Recalculate SEQ and ACK
+                        // Recalculate SEQ, ACK
+                        if (stream->C2S_modified_bytes != 0 || stream->S2C_modified_bytes != 0 ) {
+                            if (src_port > dst_port) { // C2S connection
+                                tcp_hdr->sent_seq = rte_cpu_to_be_32(seq + stream->C2S_modified_bytes);
+                                tcp_hdr->recv_ack = rte_cpu_to_be_32(ack - stream->S2C_modified_bytes);
+                            } else { // S2C connection
+                                tcp_hdr->sent_seq = rte_cpu_to_be_32(seq + stream->S2C_modified_bytes);
+                                tcp_hdr->recv_ack = rte_cpu_to_be_32(ack - stream->C2S_modified_bytes);
+                            }
+                            recalc_checksum = true;
+                        }
 
                         // Update modified bytes
+                        if (diff != 0) {
+                            if (src_port > dst_port) { // C2S connection
+                                if (seq != stream->C2S_last_seq) { // if the packet is not TCP retransmission
+                                    stream->C2S_modified_bytes += diff;
+                                    cout << "diff so far: " << stream->C2S_modified_bytes << endl;
+                                }
+                            } else { // S2C connection
+                                if (seq != stream->S2C_last_seq) { // if the packet is not TCP retransmission
+                                    stream->S2C_modified_bytes += diff;
+                                    cout << "diff so far: " << stream->S2C_modified_bytes << endl;
+                                }
+                            }
+                            recalc_checksum = true;
+                        }
+
+                        // Update stream information
                         if (src_port > dst_port) { // C2S connection
-                            stream->C2S_modified_bytes += diff;
-                            cout << "diff so far: " << stream->C2S_modified_bytes << endl;
+                            stream->C2S_last_seq = seq;
                         } else { // S2C connection
-                            stream->S2C_modified_bytes += diff;
-                            cout << "diff so far: " << stream->S2C_modified_bytes << endl;
+                            stream->S2C_last_seq = seq;
+                        }
+
+                        // recalculate checksum
+                        if (recalc_checksum) {
+                            ipv4_hdr->hdr_checksum = 0;
+                            tcp_hdr->cksum = 0;
+                            ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
+                            tcp_hdr->cksum = rte_ipv4_udptcp_cksum(ipv4_hdr, tcp_hdr);
                         }
 
                     } else if (ipv4_hdr->next_proto_id == IPPROTO_UDP) { 
