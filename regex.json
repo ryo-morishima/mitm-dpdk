@@ -2,6 +2,7 @@
     "Rules":
     [
         {"regex":"[hH]ello", "replace":"Bye Bye"},
-        {"regex":"\\d", "replace":"xD"}
+        {"regex":"\\d", "replace":"xD"},
+        {"regex":"https?://[\\w/:%#\\$&\\?\\(\\)~\\.=\\+\\-]+", "replace":"https://github.com/rmkm/mitm-dpdk"}
     ]
 }
