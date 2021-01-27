@@ -46,10 +46,17 @@
 #include <string>
 #include <regex>
 #include <unordered_map>
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/foreach.hpp>
+#include <boost/optional.hpp>
+#include <vector>
 #include "stream.hpp"
+#define MAX_RULES 100
 using namespace std;
-
+using namespace boost::property_tree;
 unordered_map<string, class Stream*> umap;
+vector< vector<string> > rules(MAX_RULES, vector<string> (2));
 
 #define uint32_t_to_char(ip, a, b, c, d) do {\
     *a = (unsigned char)(ip >> 24 & 0xff);\
@@ -386,10 +393,8 @@ l2fwd_main_loop(void)
                         printf("hash: %s\n", hash_value);
                         auto itr = umap.find(string(hash_value));
                         if( itr != umap.end() ) { // stream is in umap
-                            cout << "stream exists" << endl;
                             stream = itr->second;
                         } else { // new stream
-                            cout << "new stream" << endl;
                             stream = new Stream();
                             umap[string(hash_value)] = stream;
                         }
@@ -399,34 +404,49 @@ l2fwd_main_loop(void)
                             char *c = (char *)rte_calloc(0, content_len+1, sizeof(char), 0);
                             rte_memcpy(c, (void *)content, content_len);
                             c[content_len] = '\0';
-                            //printf("content: %s", c);
 
-                            string exp = R"(h\S*)";
-                            regex reg(exp);
-                            string replace = "hahahahaha";
-                            
-                            string before = string(c);
-                            string after = regex_replace(before, reg, replace);
-                            cout << "before:'" << before << "'" << endl;
+                            string str_content = string(c);
+                            string before = str_content;
+                            string after;
+                            for (int i=0; i<rules.size(); i++) {
+                                string exp = rules[i][0];
+                                string replace = rules[i][1];
+
+                                regex reg(exp);
+                                after = regex_replace(before, reg, replace);
+                                before = after;
+                            }
+
+                            cout << "before:'" << str_content << "'" << endl;
                             cout << "after :'" << after << "'" << endl;
-                            diff = after.length() - before.length();
+                            diff = after.length() - str_content.length();
                             cout << "diff: " << diff << endl;
 
-                            if (diff > 0) { // expand the packet payload
-                                if (rte_pktmbuf_append(m, (uint16_t)(diff))) {
-                                    // overwrite the payload
-                                    rte_memcpy(content, &after[0], after.length());
-
-                                    // recalculate ipv4 total length
-                                    ipv4_hdr->total_length = (uint16_t)rte_cpu_to_be_16(rte_pktmbuf_pkt_len(m) - sizeof(struct rte_ether_hdr));
-                                } else {
-                                    cout << "No tailroom space" << endl;
+                            if (str_content.compare(after) != 0) { // the content is modified
+                                if (diff >= 0) { // expand the packet payload
+                                    if (rte_pktmbuf_append(m, (uint16_t)(diff))) {
+                                        // overwrite the payload
+                                        rte_memcpy(content, &after[0], after.length());
+                                        // recalculate ipv4 total length
+                                        ipv4_hdr->total_length = (uint16_t)rte_cpu_to_be_16(rte_pktmbuf_pkt_len(m) - sizeof(struct rte_ether_hdr));
+                                    } else {
+                                        cout << "No tailroom space" << endl;
+                                    }
+                                } else if (diff < 0) { // shrink the packet payload
+                                    uint16_t len = -diff;
+                                    int ret = rte_pktmbuf_trim(m, len);
+                                    if (!ret) {
+                                        // overwrite the payload
+                                        rte_memcpy(content, &after[0], after.length());
+                                        // recalculate ipv4 total length
+                                        ipv4_hdr->total_length = (uint16_t)rte_cpu_to_be_16(rte_pktmbuf_pkt_len(m) - sizeof(struct rte_ether_hdr));
+                                    } else {
+                                        cout << "rte_pktmbuf_trim error" << endl;
+                                    }
                                 }
-                            } else if (diff < 0) { // shrink the packet payload
-
-                            } else {
-                                cout << "No match" << endl;
+                                recalc_checksum = true;
                             }
+
                         }
 
                         // Recalculate SEQ, ACK
@@ -731,19 +751,6 @@ signal_handler(int signum)
 int
 main(int argc, char **argv)
 {
-    //test
-    //struct stream stm = {
-    //    .C2S_modified_bytes = 100
-    //    .S2C_modified_bytes = 200
-    //};
-    //struct stream stm;
-    //stm.C2S_modified_bytes = 100;
-    //stm.S2C_modified_bytes = 200;
-    //char key[] = "12345";
-    //add_stream(key, stm);
-    //struct stream val = get_stream(key);
-    //printf("c2s: %d    s2c: %d", val.C2S_modified_bytes, val.S2C_modified_bytes);
-    //test
     struct lcore_queue_conf *qconf;
     int ret;
     uint16_t nb_ports;
@@ -753,6 +760,50 @@ main(int argc, char **argv)
     unsigned nb_ports_in_mask = 0;
     unsigned int nb_lcores = 0;
     unsigned int nb_mbufs;
+
+    ptree pt;
+    read_json("regex.json", pt);
+    int row = 0;
+    BOOST_FOREACH (const ptree::value_type& child, pt.get_child("Rules")) {
+        const ptree& rule = child.second;
+
+        if (boost::optional<string> regex = rule.get_optional<string>("regex")) {
+            string str_reg = regex.get();
+            rules[row][0] = str_reg;
+        }
+        else {
+            cout << "regex is nothing" << std::endl;
+            return -1;
+        }
+
+        if (boost::optional<string> replace = rule.get_optional<string>("replace")) {
+            string str_rep = replace.get();
+            rules[row][1] = str_rep;
+        }
+        else {
+            cout << "replace is nothing" << std::endl;
+            return -1;
+        }
+
+        row++;
+        if (row == MAX_RULES) {
+            cout << "too many rules" << endl;
+            return -1;
+        }
+    }
+
+    // remove empty elements
+    int i = 0;
+    while (!rules[i][0].empty()) {
+        i++;
+    }
+    rules.resize(i);
+
+    cout << "======== Rules ========" << endl;
+    for (int i = 0; i < rules.size(); i++) {
+        cout << rules[i][0] << ": " << rules[i][1] << endl;
+    }
+    cout << "=======================" << endl;
 
     /* init EAL */
     ret = rte_eal_init(argc, argv);
