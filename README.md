@@ -2,6 +2,7 @@
 Simple man-in-the-middle attack with DPDK
 
 # Demo
+![demo](https://github.com/rmkm/mitm-dpdk/wiki/images/demo.png)
 ![demo](https://github.com/rmkm/mitm-dpdk/wiki/images/demo.gif)
 
 # Features
